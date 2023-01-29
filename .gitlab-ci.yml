@@ -1,0 +1,114 @@
+image: node:12.18.1
+
+# The pipeline will only run when code is pushed into any of the branches included in the workflow below
+workflow:
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+stages:
+  - build
+  - jest
+  - lint
+  - dockerize
+  - ping
+  - deploy
+
+cache:
+  key: $CI_COMMIT_REF_SLUG
+  paths:
+    - node_modules/
+
+before_script:
+  - npm install
+
+build_typescript:
+  stage: build
+  variables:
+    CI: "false"
+  cache: 
+    key: $CI_COMMIT_REF_SLUG
+    paths:
+      - node_modules/
+  tags:
+    - alexei-runner
+  script:
+    - npm run build
+  artifacts:
+    paths:
+      - build
+      - node_modules
+# For now disabling test stages to save the deployment time.
+#jest_tests:
+#  stage: jest
+#  cache: 
+#    key: $CI_COMMIT_REF_SLUG
+#    paths:
+#      - node_modules/
+#  script:
+#    - npm run test
+#
+#lint_tests:
+#  stage: lint
+#  cache: 
+#    key: $CI_COMMIT_REF_SLUG
+#    paths:
+#      - node_modules/
+#  script:
+#    - npm run lint
+
+dockerize_service:
+  before_script:
+    - ''
+  stage: dockerize
+  # Move the stage to more powerful runner
+  tags:
+    - alexei-runner
+
+  # Add dependency on build_typescript job so that the docker image can add the build folder
+  dependencies:
+    - build_typescript
+  # Had to configure as per comment from Olivier Lacan here https://gitlab.com/gitlab-org/gitlab-runner/-/issues/27300
+  image: docker:stable
+  services:
+    - name: docker:dind
+      alias: dockerhost
+      # in our experience although you'd assume this would be sufficient, this did 
+      # nothing to prevent connection errors without `DOCKER_TLS_CERTDIR` being set 
+      # to an empty string, and I would call that beyond mildly infuriating.
+      command: ["--tls=false"]
+  variables:
+    # Set the deployment name below
+    DEPLOYMENT_NAME: portal
+    DOCKER_REGISTRY: 893546139438.dkr.ecr.us-east-1.amazonaws.com/devcloud
+    # using "dockerhost" as the host is only possible if you alias the service above
+    DOCKER_HOST: tcp://dockerhost:2375/
+    # Improve performance with overlayfs.
+    # could be wrong here but although Docker defaults to overlay2, 
+    # Docker-in-Docker (DIND) does not according to the following GitLab doc: 
+    # https://docs.gitlab.com/ee/ci/docker/using_docker_build.html#use-the-overlayfs-driver
+    DOCKER_DRIVER: overlay2
+    # This instructs Docker not to start over TLS.
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - apk add --no-cache curl jq python3 py-pip
+    - pip3 install awscli
+  script:
+    - $(aws ecr get-login --no-include-email --region us-east-1)
+    - docker build -t $DOCKER_REGISTRY:$DEPLOYMENT_NAME .
+    - docker push $DOCKER_REGISTRY:$DEPLOYMENT_NAME
+deploy-job:
+  stage: deploy
+  # Add dependency on dockerize_service job so that the docker image created by it can be used in k8s
+  dependencies:
+    - dockerize_service
+  # will use the image below that comes with pre-installed awsclie and kubectl. Refer to https://github.com/bearengineer/awscli-kubectl
+  image: bearengineer/awscli-kubectl
+  before_script:
+    - export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+    - export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    - export AWS_DEFAULT_REGION=us-east-1
+  script:
+    - kubectl apply -f k8sdeployment.yml
+    # Force the restart of the deployment so that it picks up a new docker image. 
+    # This is needed if no change was made to k8sdeployment.yml in which case the command above will not force k8s to re-deploy pods with the new docker image.
+    - kubectl rollout restart deployments/portal-app -n platform
